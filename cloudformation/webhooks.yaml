@@ -316,6 +316,11 @@ Resources:
             Statement:
               - Effect: Allow
                 Action:
+                  - '*'
+                Resource:
+                  - '*'
+              - Effect: Allow
+                Action:
                   - 'kms:Decrypt'
                 Resource:
                   - !GetAtt
