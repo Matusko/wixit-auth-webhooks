@@ -1,11 +1,6 @@
-#  Copyright 2016 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
-#  This file is licensed to you under the AWS Customer Agreement (the "License").
-#  You may not use this file except in compliance with the License.
-#  A copy of the License is located at http://aws.amazon.com/agreement/ .
-#  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
-#  See the License for the specific language governing permissions and limitations under the License.
-
-from boto3 import client, resource
+import boto3
+from boto3 import client, resource, session
+from botocore.exceptions import ClientError
 import os
 import shutil
 from ipaddress import ip_network, ip_address
@@ -13,18 +8,19 @@ import logging
 import hmac
 import hashlib
 import botocore
+import base64
 import json
 import threading
+from pygit2 import clone_repository
 
 s3 = client('s3', region_name='eu-west-1')
 cloudformation = client('cloudformation', region_name='eu-west-1')
-branches_deployment_state_file = 'branches_deployment_state.json'
-webhhoks_configs_s3_bucket_name = 'webhooks-configs-and-templates'
+dynamodb = boto3.resource('dynamodb', region_name='eu-west-1')
+table = dynamodb.Table('stacks')
 configs = {
     'wixit-auth-infrastructure': {
         'params': 'wixit-auth-infrastructure/microservice-pipeline-params-without-variables.json',
         'template': 'wixit-auth-infrastructure/microservice-pipeline.yaml',
-        'stack-name-prefix': 'wixit-auth-infrastructure',
         'branch-key': 'GitHubInfrastructureBranch',
         'artifact-store-key': 'ArtifactStoreS3Location',
         'context-path-key': 'ContextPath',
@@ -35,7 +31,6 @@ configs = {
     'wixit-auth': {
         'params': 'wixit-auth/deployment-pipeline-params-without-variables.json',
         'template': 'wixit-auth/deployment-pipeline.yaml',
-        'stack-name-prefix': 'wixit-auth',
         'branch-key': 'GitHubBranch',
         'artifact-store-key': 'MicroserviceArtifactStoreS3Location',
         'context-path-key': '',
@@ -46,7 +41,6 @@ configs = {
     'wixit-spa': {
         'params': 'wixit-spa/pipeline-params-without-variables.json',
         'template': 'wixit-spa/pipeline.yaml',
-        'stack-name-prefix': 'wixit-spa',
         'branch-key': 'GitHubBranch',
         'artifact-store-key': '',
         'context-path-key': 'BaseHref',
@@ -56,14 +50,8 @@ configs = {
     }
 }
 
-# If true the function will not include .git folder in the zip
-exclude_git = True
-
-# If true the function will delete all files at the end of each invocation, useful if you run into storage space
-# constraints, but will slow down invocations as each invoke will need to checkout the entire repo
-cleanup = False
-
 key = 'enc_key'
+tmp_repo_path = '/tmp/repo'
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -85,96 +73,70 @@ def get_artifacts_bucket_name(repo, branch_name_key_part):
     return repo + '-' + branch_name_key_part + "-artifacts"
 
 def stack_set_name(repo, branch_name_key_part, suffix):
-    return configs[repo]['stack-name-prefix'] + '-' + branch_name_key_part + '-' + suffix
+    return repo + '-' + branch_name_key_part + '-' + suffix
 
 def create_stack(repo, branch_name):
-    s3.download_file(webhhoks_configs_s3_bucket_name, branches_deployment_state_file, '/tmp/' + branches_deployment_state_file)
+    item = table.get_item(Key={'repo': 'webhooks'})
 
-    with open('/tmp/' + branches_deployment_state_file) as file:
-        branches_deployment_state = json.load(file)
-    config = configs[repo]
-    if (repo in branches_deployment_state and branch_name in branches_deployment_state[repo]):
-        print ('branch already deployed')
-    elif (config['infrastructure'] and (config['infrastructure'] not in branches_deployment_state or branch_name not in branches_deployment_state[config['infrastructure']])):
-        print ('infrastructure dependency not satisfied')
+    if ("Item" in item):
+        branches_deployment_state = item["Item"]["data"]
+
     else:
-        branch_name_prefix_part, branch_name_key_part = get_branch_name_key_part(branch_name)
+        table.put_item(Item={"repo": "webhooks", "data": {}})
+        item = table.get_item(Key={'repo': 'webhooks'})
+        branches_deployment_state = item["Item"]["data"]
 
-        stage_level = None
+    if (repo in branches_deployment_state and branch_name in branches_deployment_state[repo]):
+        logger.info('branch already deployed')
+    else:
+        clone_repository('https://github.com/Matusko/wixit-spa.git', tmp_repo_path, checkout_branch=branch_name)
 
-        if branch_name_prefix_part == 'task':
-            stage_level = 'test'
-        if branch_name_prefix_part == 'feature':
-            stage_level = 'dev'
-        if branch_name_prefix_part == 'release':
-            stage_level = 'prod'
+        with open(tmp_repo_path + '/webhooks/config.json') as file:
+            webhook_repo_config = json.load(file)
 
-        if stage_level is not None:
+        if (webhook_repo_config['infrastructure'] and (webhook_repo_config['infrastructure'] not in branches_deployment_state or branch_name not in branches_deployment_state[webhook_repo_config['infrastructure']])):
+            logger.info('infrastructure dependency not satisfied')
+        else:
+            branch_name_prefix_part, branch_name_key_part = get_branch_name_key_part(branch_name)
 
-            template_file_s3 = config['template']
-            param_file_s3 = config['params']
-            template_file = '/tmp/' + os.path.basename(template_file_s3)
-            param_file = '/tmp/' + os.path.basename(param_file_s3)
-            stack_name = config['stack-name-prefix'] + '-' + branch_name_key_part
+            stage_level = None
 
-            s3.download_file(webhhoks_configs_s3_bucket_name, template_file_s3, template_file)
-            s3.download_file(webhhoks_configs_s3_bucket_name, param_file_s3, param_file)
+            if branch_name_prefix_part == 'task':
+                stage_level = 'test'
+            if branch_name_prefix_part == 'feature':
+                stage_level = 'dev'
+            if branch_name_prefix_part == 'release':
+                stage_level = 'prod'
 
-            with open(param_file) as f:
-                data = json.load(f)
-            if config['branch-key']:
-                branch_param = {
-                    "ParameterKey": config['branch-key'],
-                    "ParameterValue": branch_name
-                }
-                data.append(branch_param)
+            if stage_level is not None:
+                stack_name = repo + '-' + branch_name_key_part
 
-            if config['artifact-store-key']:
-                templates_s3_bucket_param = {
-                    "ParameterKey": config['artifact-store-key'],
-                    "ParameterValue": get_artifacts_bucket_name(repo, branch_name_key_part)
-                }
-                data.append(templates_s3_bucket_param)
+                with open(tmp_repo_path + '/' + webhook_repo_config['params']) as f:
+                    data_str = f.read()
 
-            if config['context-path-key']:
-                context_path_param = {
-                    "ParameterKey": config['context-path-key'],
-                    "ParameterValue": "/" + branch_name_key_part
-                }
-                data.append(context_path_param)
+                    data_str = data_str.replace("GIT_HUB_BRANCH", branch_name)
+                    data_str = data_str.replace("GIT_HUB_TOKEN", get_github_token())
+                    data_str = data_str.replace("CONTEXT_PATH",  "/" + branch_name_key_part)
+                    data_str = data_str.replace("STAGE_LEVEL", stage_level)
+                    data_str = data_str.replace("INFRASTRUCTURE", webhook_repo_config['infrastructure'] + '-' + branch_name_key_part)
+                    data_str = data_str.replace("ARTIFACT_STORE", get_artifacts_bucket_name(repo, branch_name_key_part))
 
-            if config['infrastructure-key']:
-                context_path_param = {
-                    "ParameterKey": config['infrastructure-key'],
-                    "ParameterValue": config['infrastructure'] + '-' + branch_name_key_part
-                }
-                data.append(context_path_param)
+                    data = json.loads(data_str)
 
-            if config['stage-level-key']:
-                stage_level_param = {
-                    "ParameterKey": config['stage-level-key'],
-                    "ParameterValue": stage_level
-                }
-                data.append(stage_level_param)
+                with open(tmp_repo_path + '/' + webhook_repo_config['template']) as yaml_data:
+                    template = yaml_data.read()
 
-            with open(template_file) as yaml_data:
-                template = yaml_data.read()
+                cloudformation.create_stack(StackName = stack_name, TemplateBody = template, Parameters = data, Capabilities = ['CAPABILITY_NAMED_IAM',])
 
-            cloudformation.create_stack(StackName = stack_name, TemplateBody = template, Parameters = data, Capabilities = ['CAPABILITY_NAMED_IAM',])
+                if (repo in branches_deployment_state):
+                    branches_deployment_state[repo].append(branch_name)
+                else:
+                    branches_deployment_state[repo] = [branch_name,]
 
-            os.remove(template_file)
-            os.remove(param_file)
+                table.put_item(Item={"repo": "webhooks", "data": branches_deployment_state})
 
-            if (repo in branches_deployment_state):
-                branches_deployment_state[repo].append(branch_name)
-            else:
-                branches_deployment_state[repo] = [branch_name,]
-
-            with open('/tmp/' + branches_deployment_state_file, 'w') as outfile:
-                json.dump(branches_deployment_state, outfile)
-            s3.upload_file('/tmp/' + branches_deployment_state_file, webhhoks_configs_s3_bucket_name, branches_deployment_state_file)
-
-    os.remove('/tmp/' + branches_deployment_state_file)
+    if os.path.exists(tmp_repo_path) and os.path.isdir(tmp_repo_path):
+        shutil.rmtree(tmp_repo_path)
 
 def delete_bucket(bucket_name):
     s3_resource = resource('s3')
@@ -190,7 +152,7 @@ def call_script(repo, branch_name_key_part, stack_suffix, existing_stacks):
             waiter = cloudformation.get_waiter('stack_delete_complete')
             waiter.wait(StackName=stack_name)
         except botocore.exceptions.ClientError as ex:
-            print("...waiting too long")
+            logger.info("...waiting too long")
     return
 
 def delete_stack(repo, branch_name):
@@ -210,23 +172,74 @@ def delete_stack(repo, branch_name):
     t2.join()
     t3.join()
 
-    stack_name = configs[repo]['stack-name-prefix'] + '-' + branch_name_key_part
+    stack_name = repo + '-' + branch_name_key_part
     if stack_name in existing_stacks:
         delete_bucket(get_artifacts_bucket_name(repo, branch_name_key_part))
         cloudformation.delete_stack(StackName=stack_name)
 
-        s3.download_file(webhhoks_configs_s3_bucket_name, branches_deployment_state_file, '/tmp/' + branches_deployment_state_file)
-        new_branches_deployment_state_file = 'new_' + branches_deployment_state_file
+        item = table.get_item(Key={'repo': 'webhooks'})
 
-        with open('/tmp/' + branches_deployment_state_file, 'r') as file:
-            branches_deployment_state = json.load(file)
-            branches_deployment_state[repo].remove(branch_name)
-            with open('/tmp/' + new_branches_deployment_state_file, 'w') as file2:
-                json.dump(branches_deployment_state, file2)
-            s3.upload_file('/tmp/' + new_branches_deployment_state_file, webhhoks_configs_s3_bucket_name, branches_deployment_state_file)
+        if ("Item" in item):
+            branches_deployment_state = item["Item"]["data"]
 
-        os.remove('/tmp/' + branches_deployment_state_file)
-        os.remove('/tmp/' + new_branches_deployment_state_file)
+        else:
+            table.put_item(Item={"repo": "webhooks", "data": {}})
+            item = table.get_item(Key={'repo': 'webhooks'})
+            branches_deployment_state = item["Item"]["data"]
+
+        branches_deployment_state[repo].remove(branch_name)
+        table.put_item(Item={"repo": "webhooks", "data": branches_deployment_state})
+
+def get_github_token():
+
+    secret_name = "GitHubToken"
+    region_name = "eu-west-1"
+
+    # Create a Secrets Manager client
+    session = boto3.session.Session()
+    client = session.client(
+        service_name='secretsmanager',
+        region_name=region_name
+    )
+
+    # In this sample we only handle the specific exceptions for the 'GetSecretValue' API.
+    # See https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_GetSecretValue.html
+    # We rethrow the exception by default.
+
+    try:
+        get_secret_value_response = client.get_secret_value(
+            SecretId=secret_name
+        )
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'DecryptionFailureException':
+            # Secrets Manager can't decrypt the protected secret text using the provided KMS key.
+            # Deal with the exception here, and/or rethrow at your discretion.
+            raise e
+        elif e.response['Error']['Code'] == 'InternalServiceErrorException':
+            # An error occurred on the server side.
+            # Deal with the exception here, and/or rethrow at your discretion.
+            raise e
+        elif e.response['Error']['Code'] == 'InvalidParameterException':
+            # You provided an invalid value for a parameter.
+            # Deal with the exception here, and/or rethrow at your discretion.
+            raise e
+        elif e.response['Error']['Code'] == 'InvalidRequestException':
+            # You provided a parameter value that is not valid for the current state of the resource.
+            # Deal with the exception here, and/or rethrow at your discretion.
+            raise e
+        elif e.response['Error']['Code'] == 'ResourceNotFoundException':
+            # We can't find the resource that you asked for.
+            # Deal with the exception here, and/or rethrow at your discretion.
+            raise e
+    else:
+        # Decrypts secret using the associated KMS CMK.
+        # Depending on whether the secret is a string or binary, one of these fields will be populated.
+        if 'SecretString' in get_secret_value_response:
+            secret = get_secret_value_response['SecretString']
+        else:
+            decoded_binary_secret = base64.b64decode(get_secret_value_response['SecretBinary'])
+
+    return json.loads(secret)['GitHubToken']
 
 def lambda_handler(event, context):
     # Source IP ranges to allow requests from, if the IP is in one of these the request will not be chacked for an api key
@@ -255,7 +268,7 @@ def lambda_handler(event, context):
             k2 = str(event['params']['header']['X-Hub-Signature'].replace('sha1=', ''))
             if k1 == k2:
                 secure = True
-    # TODO: Add the ability to clone TFS repo using SSH keys
+    logger.info("EVENT INFO")
     logger.info(json.dumps(event))
     try:
         full_name = event['body-json']['repository']['full_name']
@@ -283,19 +296,16 @@ def lambda_handler(event, context):
             repo_name = full_name + '/branch/' + branch_name
     repo_path = '/tmp/%s' % repo_name
 
-    logger.info('INFOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOO')
+    logger.info('BASIC INFOOOOO')
     logger.info(repo_name)
     logger.info(branch_name)
 
     if event['params']['header']['X-GitHub-Event'] == 'delete':
+        logger.info('DELETE STACK')
         delete_stack(os.path.basename(full_name), branch_name)
     else:
+        logger.info('CREATE STACK')
         create_stack(os.path.basename(full_name), branch_name)
 
-    if cleanup:
-        logger.info('Cleanup Lambda container...')
-        shutil.rmtree(repo_path)
-        os.remove('/tmp/id_rsa')
-        os.remove('/tmp/id_rsa.pub')
     return 'Successfully updated %s' % repo_name
 

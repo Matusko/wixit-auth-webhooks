@@ -157,6 +157,19 @@ Resources:
             Condition:
               Bool:
                 'kms:GrantIsForAWSResource': true
+  CreatedStacksTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+      - AttributeName: repo
+        AttributeType: S
+      KeySchema:
+      - AttributeName: repo
+        KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+      TableName: stacks
   CreateSSHKeyRole:
     Type: 'AWS::IAM::Role'
     Properties:
