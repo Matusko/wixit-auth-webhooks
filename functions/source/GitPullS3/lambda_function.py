@@ -75,7 +75,7 @@ def get_artifacts_bucket_name(repo, branch_name_key_part):
 def stack_set_name(repo, branch_name_key_part, suffix):
     return repo + '-' + branch_name_key_part + '-' + suffix
 
-def create_stack(repo, branch_name):
+def create_stack(repo, branch_name, clone_url):
     item = table.get_item(Key={'repo': 'webhooks'})
 
     if ("Item" in item):
@@ -89,7 +89,9 @@ def create_stack(repo, branch_name):
     if (repo in branches_deployment_state and branch_name in branches_deployment_state[repo]):
         logger.info('branch already deployed')
     else:
-        clone_repository('https://github.com/Matusko/wixit-spa.git', tmp_repo_path, checkout_branch=branch_name)
+        if os.path.exists(tmp_repo_path) and os.path.isdir(tmp_repo_path):
+            shutil.rmtree(tmp_repo_path)
+        clone_repository(clone_url, tmp_repo_path, checkout_branch=branch_name)
 
         with open(tmp_repo_path + '/webhooks/config.json') as file:
             webhook_repo_config = json.load(file)
@@ -270,6 +272,7 @@ def lambda_handler(event, context):
                 secure = True
     logger.info("EVENT INFO")
     logger.info(json.dumps(event))
+    clone_url = event['body-json']['repository']['clone_url']
     try:
         full_name = event['body-json']['repository']['full_name']
     except KeyError:
@@ -305,7 +308,7 @@ def lambda_handler(event, context):
         delete_stack(os.path.basename(full_name), branch_name)
     else:
         logger.info('CREATE STACK')
-        create_stack(os.path.basename(full_name), branch_name)
+        create_stack(os.path.basename(full_name), branch_name, clone_url)
 
     return 'Successfully updated %s' % repo_name
 
